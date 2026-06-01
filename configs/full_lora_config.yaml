@@ -4,7 +4,7 @@
 
 # Model settings
 model:
-  name: "facebook/sam3"
+  name: "/home/model/sam3_pth/sam3pt/sam3.pt"
   cache_dir: null
 
 # LoRA settings
@@ -62,11 +62,11 @@ lora:
 
 # Training settings
 training:
-  data_dir: "/workspace/data"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 4      # Increased from 1 to reduce gradient variance
-  num_workers: 2        # Increase for better data loading
+  data_dir: "/home/model/work/SAM3_LoRA/data"  # Root directory containing train/valid/test folders with COCO annotations
+  batch_size: 2      # Increased from 1 to reduce gradient variance
+  num_workers: 0        # Set to 0 to avoid shared memory issues (use main process only)
 
-  learning_rate: 5e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+  learning_rate: 1e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -87,7 +87,7 @@ training:
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
-  output_dir: "outputs/sam3_lora_full"
+  output_dir: "outputs/sam3_lora_full_1"
   logging_dir: "logs"
   save_lora_only: true
   push_to_hub: false

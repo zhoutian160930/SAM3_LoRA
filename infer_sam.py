@@ -67,7 +67,8 @@ class SAM3LoRAInference:
         resolution: int = 1008,
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
-        device: str = "cuda"
+        device: str = "cuda",
+        checkpoint_path: Optional[str] = None
     ):
         """
         Initialize SAM3 with LoRA.
@@ -79,6 +80,7 @@ class SAM3LoRAInference:
             detection_threshold: Confidence threshold for detections (default: 0.5)
             nms_iou_threshold: IoU threshold for NMS (default: 0.5)
             device: Device to run on (default: "cuda")
+            checkpoint_path: Path to SAM3 base model checkpoint (optional)
         """
         # Load config
         with open(config_path, 'r') as f:
@@ -105,15 +107,38 @@ class SAM3LoRAInference:
         print(f"   Confidence threshold: {detection_threshold}")
         print(f"   NMS IoU threshold: {nms_iou_threshold}")
 
+        # Determine checkpoint path (same logic as training script)
+        if checkpoint_path is None:
+            checkpoint_path = self.config.get("model", {}).get("checkpoint_path")
+        
+        if checkpoint_path is None:
+            # Try default local path first
+            default_local_path = "/home/data-1/yjs/niu/code/sam3/pth/sam3.pt"
+            if os.path.exists(default_local_path):
+                checkpoint_path = default_local_path
+                print(f"   Using local checkpoint: {checkpoint_path}")
+
         # Build base model
         print("\n📦 Building SAM3 model...")
-        self.model = build_sam3_image_model(
-            device=self.device.type,
-            compile=False,
-            load_from_HF=True,
-            bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=True
-        )
+        if checkpoint_path is not None:
+            print(f"   Loading from: {checkpoint_path}")
+            self.model = build_sam3_image_model(
+                device=self.device.type,
+                compile=False,
+                load_from_HF=False,  # Use local checkpoint
+                checkpoint_path=checkpoint_path,
+                bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+                eval_mode=True
+            )
+        else:
+            print("   No local checkpoint found, downloading from HuggingFace...")
+            self.model = build_sam3_image_model(
+                device=self.device.type,
+                compile=False,
+                load_from_HF=False,
+                bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+                eval_mode=True
+            )
 
         # Apply LoRA configuration
         print("🔗 Applying LoRA configuration...")
@@ -200,6 +225,81 @@ class SAM3LoRAInference:
             )
             queries.append(query)
 
+        return Datapoint(
+            find_queries=queries,
+            images=[sam_image]
+        )
+
+    def create_datapoint_with_boxes(self, pil_image: PILImage.Image, boxes: List[List[float]], text_prompts: Optional[List[str]] = None) -> Datapoint:
+        """
+        Create a SAM3 datapoint from image and bounding boxes.
+
+        Args:
+            pil_image: PIL Image
+            boxes: List of bounding boxes in format [x1, y1, x2, y2] (pixel coordinates)
+            text_prompts: Optional list of text labels for each box
+
+        Returns:
+            Datapoint with image and box prompts
+        """
+        from sam3.train.data.sam3_image_dataset import Object
+        import torch
+        
+        w, h = pil_image.size
+        
+        # Create objects from boxes
+        objects = []
+        for idx, box in enumerate(boxes):
+            x1, y1, x2, y2 = box
+            # Normalize to [0, 1]
+            bbox_norm = torch.tensor([x1/w, y1/h, x2/w, y2/h], dtype=torch.float32)
+            
+            # Calculate area for Object
+            area = (x2 - x1) * (y2 - y1)
+            
+            obj = Object(
+                bbox=bbox_norm,
+                area=area,
+                object_id=idx,
+                frame_index=0,
+                segment=None,  # No mask for box prompt
+                is_crowd=False
+            )
+            objects.append(obj)
+        
+        # Create SAM Image with objects
+        sam_image = SAMImage(
+            data=pil_image,
+            objects=objects,
+            size=[h, w]
+        )
+        
+        # Create query
+        if text_prompts is None:
+            text_prompts = ["object"] * len(boxes)
+        elif len(text_prompts) == 1 and len(boxes) > 1:
+            # Repeat single prompt for all boxes
+            text_prompts = text_prompts * len(boxes)
+        
+        queries = []
+        for idx, text_query in enumerate(text_prompts[:len(boxes)]):
+            query = FindQueryLoaded(
+                query_text=text_query,
+                image_id=0,
+                object_ids_output=[idx],  # Link to the object
+                is_exhaustive=True,
+                query_processing_order=idx,
+                inference_metadata=InferenceMetadata(
+                    coco_image_id=idx,
+                    original_image_id=idx,
+                    original_category_id=1,
+                    original_size=[w, h],
+                    object_id=idx,
+                    frame_index=0,
+                )
+            )
+            queries.append(query)
+        
         return Datapoint(
             find_queries=queries,
             images=[sam_image]
@@ -333,6 +433,133 @@ class SAM3LoRAInference:
 
         return results
 
+    @torch.no_grad()
+    def predict_with_boxes(
+        self,
+        image_path: str,
+        boxes: List[List[float]],
+        text_prompts: Optional[List[str]] = None
+    ) -> dict:
+        """
+        Run inference on an image with bounding box prompts.
+
+        Args:
+            image_path: Path to input image
+            boxes: List of bounding boxes in format [[x1, y1, x2, y2], ...]
+                   Coordinates are in pixels (not normalized)
+            text_prompts: Optional list of text labels for each box
+
+        Returns:
+            Dictionary with predictions for each box
+        """
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
+
+        # Load image
+        pil_image = PILImage.open(image_path).convert("RGB")
+        print(f"📷 Loaded image: {image_path}")
+        print(f"   Size: {pil_image.size}")
+        print(f"   Number of box prompts: {len(boxes)}")
+        if text_prompts:
+            print(f"   Text labels: {text_prompts}")
+
+        print("\n🔮 Running inference with box prompts...")
+
+        # Create datapoint with boxes
+        datapoint = self.create_datapoint_with_boxes(pil_image, boxes, text_prompts)
+
+        # Apply transforms
+        datapoint = self.transform(datapoint)
+
+        # Collate into batch
+        batch = collate_fn_api([datapoint], dict_key="input")["input"]
+
+        # Move to device
+        batch = copy_data_to_device(batch, self.device, non_blocking=True)
+
+        # Forward pass
+        outputs = self.model(batch)
+
+        # Manual post-processing
+        last_output = outputs[-1]
+        pred_logits = last_output['pred_logits']  # [batch, num_queries, num_classes]
+        pred_boxes = last_output['pred_boxes']    # [batch, num_queries, 4]
+        pred_masks = last_output.get('pred_masks', None)  # [batch, num_queries, H, W]
+
+        # Get probabilities
+        out_probs = pred_logits.sigmoid()  # [batch, num_queries, num_classes]
+
+        # Get scores
+        scores = out_probs[0, :, :].max(dim=-1)[0]  # [num_queries]
+
+        # Filter by threshold
+        keep = scores > self.detection_threshold
+        num_keep = keep.sum().item()
+
+        results = {}
+
+        if num_keep > 0:
+            # Get boxes and convert from cxcywh to xyxy
+            boxes_cxcywh = pred_boxes[0, keep]  # [num_keep, 4]
+            kept_scores = scores[keep]
+            cx, cy, w, h = boxes_cxcywh.unbind(-1)
+
+            # Convert to xyxy and scale to original image size
+            orig_w, orig_h = pil_image.size
+            x1 = (cx - w / 2) * orig_w
+            y1 = (cy - h / 2) * orig_h
+            x2 = (cx + w / 2) * orig_w
+            y2 = (cy + h / 2) * orig_h
+
+            boxes_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
+
+            # Apply NMS to remove overlapping boxes
+            keep_nms = nms(boxes_xyxy, kept_scores, self.nms_iou_threshold)
+            boxes_xyxy = boxes_xyxy[keep_nms]
+            kept_scores = kept_scores[keep_nms]
+            num_keep = len(keep_nms)
+
+            # Get masks and resize to original size
+            if pred_masks is not None:
+                masks_small = pred_masks[0, keep][keep_nms].sigmoid() > 0.5  # [num_keep_nms, H, W]
+
+                # Resize masks to original image size
+                import torch.nn.functional as F
+                masks_resized = F.interpolate(
+                    masks_small.unsqueeze(0).float(),
+                    size=(orig_h, orig_w),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0) > 0.5
+
+                masks_np = masks_resized.cpu().numpy()
+            else:
+                masks_np = None
+
+            results[0] = {
+                'prompt': 'box_prompts',
+                'boxes': boxes_xyxy.cpu().numpy(),
+                'scores': kept_scores.cpu().numpy(),
+                'masks': masks_np,
+                'num_detections': num_keep
+            }
+            print(f"   {num_keep} detections after NMS (max score: {kept_scores.max().item():.3f})")
+        else:
+            results[0] = {
+                'prompt': 'box_prompts',
+                'boxes': None,
+                'scores': None,
+                'masks': None,
+                'num_detections': 0
+            }
+            print(f"   0 detections")
+
+        # Store original image and input boxes for visualization
+        results['_image'] = pil_image
+        results['_input_boxes'] = boxes
+
+        return results
+
     def visualize(
         self,
         results: dict,
@@ -358,10 +585,28 @@ class SAM3LoRAInference:
         # Colors for different prompts
         colors = ['red', 'blue', 'green', 'yellow', 'cyan', 'magenta']
 
+        # Draw input boxes if available (for box prompt mode)
+        if '_input_boxes' in results:
+            input_boxes = results['_input_boxes']
+            for box in input_boxes:
+                x1, y1, x2, y2 = box
+                width = x2 - x1
+                height = y2 - y1
+                rect = patches.Rectangle(
+                    (x1, y1), width, height,
+                    linewidth=2,
+                    edgecolor='yellow',
+                    facecolor='none',
+                    linestyle='--',
+                    label='Input Box'
+                )
+                ax.add_patch(rect)
+
         total_detections = 0
 
-        # Draw results for each prompt
-        for idx in sorted([k for k in results.keys() if k != '_image']):
+        # Draw results for each prompt (filter out special keys that start with '_')
+        result_keys = [k for k in results.keys() if not str(k).startswith('_')]
+        for idx in sorted(result_keys):
             result = results[idx]
             prompt = result['prompt']
             color = colors[idx % len(colors)]
@@ -429,8 +674,9 @@ class SAM3LoRAInference:
         ax.axis('off')
 
         # Add title with all prompts
-        prompts_str = ", ".join([f'"{results[k]["prompt"]}"' for k in sorted([k for k in results.keys() if k != '_image'])])
-        plt.suptitle(f'Text Prompts: {prompts_str}', fontsize=12, y=0.98)
+        result_keys = [k for k in results.keys() if not str(k).startswith('_')]
+        prompts_str = ", ".join([f'"{results[k]["prompt"]}"' for k in sorted(result_keys)])
+        plt.suptitle(f'Prompts: {prompts_str}', fontsize=12, y=0.98)
 
         plt.tight_layout()
         plt.savefig(output_path, bbox_inches='tight', dpi=150)
@@ -468,6 +714,14 @@ def main():
         help='Text prompt(s) to guide segmentation (e.g., "crack" or "crack" "defect")'
     )
     parser.add_argument(
+        "--box",
+        type=float,
+        nargs='+',
+        default=None,
+        help='Bounding box prompt(s) in format: x1 y1 x2 y2 [x1 y1 x2 y2 ...] '
+             'Multiple boxes are separated by spaces. Example: --box 100 100 200 200 300 300 400 400'
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default="output.png",
@@ -502,6 +756,12 @@ def main():
         default=0.5,
         help="NMS IoU threshold (default: 0.5, lower = fewer overlapping boxes)"
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="/home/model/sam3_pth/sam3pt/sam3.pt",
+        help="Path to SAM3 base model checkpoint (optional, will use local path if available)"
+    )
 
     args = parser.parse_args()
 
@@ -511,11 +771,27 @@ def main():
         weights_path=args.weights,
         resolution=args.resolution,
         detection_threshold=args.threshold,
-        nms_iou_threshold=args.nms_iou
+        nms_iou_threshold=args.nms_iou,
+        checkpoint_path=args.checkpoint
     )
 
-    # Run inference
-    results = inferencer.predict(args.image, args.prompt)
+    # Run inference - choose mode based on input
+    if args.box is not None:
+        # Box prompt mode
+        if len(args.box) % 4 != 0:
+            raise ValueError(f"Box coordinates must be in groups of 4 (x1 y1 x2 y2). Got {len(args.box)} values.")
+        
+        # Parse boxes
+        boxes = []
+        for i in range(0, len(args.box), 4):
+            boxes.append(args.box[i:i+4])
+        
+        print(f"\n📦 Box Prompt Mode: {len(boxes)} box(es)")
+        results = inferencer.predict_with_boxes(args.image, boxes, args.prompt)
+    else:
+        # Text prompt mode
+        print(f"\n💬 Text Prompt Mode")
+        results = inferencer.predict(args.image, args.prompt)
 
     # Visualize
     inferencer.visualize(
@@ -528,7 +804,8 @@ def main():
     # Print summary
     print("\n" + "="*60)
     print("📊 Summary:")
-    for idx in sorted([k for k in results.keys() if k != '_image']):
+    result_keys = [k for k in results.keys() if not str(k).startswith('_')]
+    for idx in sorted(result_keys):
         result = results[idx]
         print(f"   Prompt '{result['prompt']}': {result['num_detections']} detections")
         if result['num_detections'] > 0 and result['scores'] is not None:

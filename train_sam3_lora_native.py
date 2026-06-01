@@ -14,6 +14,9 @@ Multi-GPU Training:
   Single GPU:
     python train_sam3_lora_native.py --config configs/full_lora_config.yaml
 
+  Single GPU with local checkpoint:
+    python train_sam3_lora_native.py --config configs/full_lora_config.yaml --checkpoint /path/to/sam3.pt
+
   Multi-GPU (DDP):
     torchrun --nproc_per_node=2 train_sam3_lora_native.py --config configs/full_lora_config.yaml --multi-gpu
 
@@ -762,7 +765,7 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 
 class SAM3TrainerNative:
-    def __init__(self, config_path, multi_gpu=False):
+    def __init__(self, config_path, multi_gpu=False, checkpoint_path=None):
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
@@ -779,15 +782,39 @@ class SAM3TrainerNative:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # Determine checkpoint path
+        # Priority: 1. command line argument, 2. config file, 3. default local path, 4. HuggingFace
+        if checkpoint_path is None:
+            checkpoint_path = self.config.get("model", {}).get("checkpoint_path")
+        
+        if checkpoint_path is None:
+            # Try default local path first
+            default_local_path = "/home/data-1/yjs/niu/code/sam3/pth/sam3.pt"
+            if os.path.exists(default_local_path):
+                checkpoint_path = default_local_path
+                print_rank0(f"Using local checkpoint: {checkpoint_path}")
+        
         # Build Model
         print_rank0("Building SAM3 model...")
-        self.model = build_sam3_image_model(
-            device=self.device.type,
-            compile=False,
-            load_from_HF=True,  # Tries to download from HF if checkpoint_path is None
-            bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
-            eval_mode=False
-        )
+        if checkpoint_path is not None:
+            print_rank0(f"Loading model from: {checkpoint_path}")
+            self.model = build_sam3_image_model(
+                device=self.device.type,
+                compile=False,
+                load_from_HF=False,  # Don't download from HF when using local checkpoint
+                checkpoint_path=checkpoint_path,
+                bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+                eval_mode=False
+            )
+        else:
+            print_rank0("No local checkpoint found, will attempt to download from HuggingFace...")
+            self.model = build_sam3_image_model(
+                device=self.device.type,
+                compile=False,
+                load_from_HF=True,  # Download from HF as fallback
+                bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
+                eval_mode=False
+            )
 
         # Apply LoRA
         print_rank0("Applying LoRA...")
@@ -1213,6 +1240,10 @@ def launch_distributed_training(args):
         "--device", *map(str, devices),
         "--_launched_by_torchrun"  # Internal flag to indicate we're in subprocess
     ]
+    
+    # Add checkpoint argument if provided
+    if args.checkpoint:
+        cmd.extend(["--checkpoint", args.checkpoint])
 
     # Set environment variable for visible devices
     env = os.environ.copy()
@@ -1248,8 +1279,15 @@ Examples:
     parser.add_argument(
         "--config",
         type=str,
-        default="configs/full_lora_config.yaml",
+        default="/home/model/work/SAM3_LoRA/configs/full_lora_config.yaml",
         help="Path to YAML configuration file"
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="/home/model/sam3_pth/sam3pt/sam3.pt",
+        help="Path to SAM3 checkpoint file (e.g., sam3.pt). "
+             "If not provided, will try: 1) config file, 2) /home/data-1/yjs/niu/code/sam3/pth/sam3.pt, 3) download from HuggingFace"
     )
     parser.add_argument(
         "--device",
@@ -1294,5 +1332,5 @@ Examples:
             os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device[0])
             print(f"Using single GPU: {args.device[0]}")
 
-        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu)
+        trainer = SAM3TrainerNative(args.config, multi_gpu=multi_gpu, checkpoint_path=args.checkpoint)
         trainer.train()

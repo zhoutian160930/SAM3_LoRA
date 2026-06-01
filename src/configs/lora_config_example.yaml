@@ -12,7 +12,7 @@ paths:
   data_root: /workspace/sam3_lora/data
   experiment_log_dir: /workspace/sam3_lora/experiments
   bpe_path: ./sam3/assets/bpe_simple_vocab_16e6.txt.gz  # Path to BPE vocab file
-  sam3_checkpoint: null  # Path to pretrained SAM3 checkpoint (set to null if not available)
+  sam3_checkpoint: /home/data-1/yjs/niu/code/sam3/pth/sam3.pt  # Path to pretrained SAM3 checkpoint (set to null if not available)
 
 # ============================================================================
 # LoRA Configuration
@@ -44,10 +44,10 @@ lora:
 # ============================================================================
 dataset:
   # Data paths
-  train_img_folder: /workspace/sam3_lora/data/train
-  train_ann_file: /workspace/sam3_lora/data/train/_annotations.coco.json
-  val_img_folder: /workspace/sam3_lora/data/valid
-  val_ann_file: /workspace/sam3_lora/data/valid/_annotations.coco.json
+  train_img_folder: /home/data-1/yjs/niu/code/sam3/hz_mask
+  train_ann_file: /home/data-1/yjs/niu/code/sam3/hz_mask/annotations_coco.json
+  val_img_folder: /home/data-1/yjs/niu/code/sam3/hz_mask
+  val_ann_file: /home/data-1/yjs/niu/code/sam3/hz_mask/annotations_coco.json
 
   # Data loading
   num_workers: 4
