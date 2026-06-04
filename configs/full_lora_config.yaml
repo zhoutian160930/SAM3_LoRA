@@ -53,20 +53,20 @@ lora:
     - "linear2"              # Transformer FFN second layer
 
   # Apply LoRA to ALL components for maximum adaptation
-  apply_to_vision_encoder: true    # Vision backbone (ViT)
-  apply_to_text_encoder: true      # Language backbone (CLIP text encoder)
-  apply_to_geometry_encoder: true  # Geometry encoder for prompts
-  apply_to_detr_encoder: true      # DETR-style transformer encoder
-  apply_to_detr_decoder: true      # DETR-style transformer decoder
+  apply_to_vision_encoder: false    # Vision backbone (ViT)
+  apply_to_text_encoder: false      # Language backbone (CLIP text encoder)
+  apply_to_geometry_encoder: false  # Geometry encoder for prompts
+  apply_to_detr_encoder: false      # DETR-style transformer encoder
+  apply_to_detr_decoder: false      # DETR-style transformer decoder
   apply_to_mask_decoder: true      # Mask prediction head
 
 # Training settings
 training:
-  data_dir: "/home/model/work/SAM3_LoRA/data"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 2      # Increased from 1 to reduce gradient variance
+  data_dir: "/home/model/work/SAM3_LoRA/dataset/lajiaoyou"  # Root directory containing train/valid/test folders with COCO annotations
+  batch_size: 8      # Increased from 1 to reduce gradient variance
   num_workers: 0        # Set to 0 to avoid shared memory issues (use main process only)
 
-  learning_rate: 1e-5        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+  learning_rate: 1e-4        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.999
@@ -87,8 +87,8 @@ training:
   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
 
 output:
-  output_dir: "outputs/sam3_lora_full_1"
-  logging_dir: "logs"
+  output_dir: "outputs/lajiaoyou_lora_0604"
+  logging_dir: "outputs/lajiaoyou_lora_0604/logs"
   save_lora_only: true
   push_to_hub: false
   hub_model_id: null
