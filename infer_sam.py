@@ -68,7 +68,8 @@ class SAM3LoRAInference:
         detection_threshold: float = 0.5,
         nms_iou_threshold: float = 0.5,
         device: str = "cuda",
-        checkpoint_path: Optional[str] = None
+        checkpoint_path: Optional[str] = None,
+        use_base_model: bool = False
     ):
         """
         Initialize SAM3 with LoRA.
@@ -81,19 +82,23 @@ class SAM3LoRAInference:
             nms_iou_threshold: IoU threshold for NMS (default: 0.5)
             device: Device to run on (default: "cuda")
             checkpoint_path: Path to SAM3 base model checkpoint (optional)
+            use_base_model: If True, skip LoRA and use native SAM3 model directly
         """
+        self.use_base_model = use_base_model
+
         # Load config
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
 
-        # Auto-detect weights if not provided
-        if weights_path is None:
-            output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
-            weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
-            print(f"ℹ️  Auto-detected weights: {weights_path}")
+        # Auto-detect weights if not provided (skip if using base model)
+        if not use_base_model:
+            if weights_path is None:
+                output_dir = self.config.get('output', {}).get('output_dir', 'outputs/sam3_lora_full')
+                weights_path = os.path.join(output_dir, 'best_lora_weights.pt')
+                print(f"ℹ️  Auto-detected weights: {weights_path}")
 
-        if not os.path.exists(weights_path):
-            raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
+            if not os.path.exists(weights_path):
+                raise FileNotFoundError(f"LoRA weights not found: {weights_path}")
 
         self.weights_path = weights_path
         self.resolution = resolution
@@ -101,7 +106,10 @@ class SAM3LoRAInference:
         self.nms_iou_threshold = nms_iou_threshold
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
-        print(f"🔧 Initializing SAM3 + LoRA...")
+        if use_base_model:
+            print(f"🔧 Initializing SAM3 (native, no LoRA)...")
+        else:
+            print(f"🔧 Initializing SAM3 + LoRA...")
         print(f"   Device: {self.device}")
         print(f"   Resolution: {resolution}x{resolution}")
         print(f"   Confidence threshold: {detection_threshold}")
@@ -140,26 +148,27 @@ class SAM3LoRAInference:
                 eval_mode=True
             )
 
-        # Apply LoRA configuration
-        print("🔗 Applying LoRA configuration...")
-        lora_cfg = self.config["lora"]
-        lora_config = LoRAConfig(
-            rank=lora_cfg["rank"],
-            alpha=lora_cfg["alpha"],
-            dropout=0.0,  # No dropout during inference
-            target_modules=lora_cfg["target_modules"],
-            apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
-            apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
-            apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
-            apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
-            apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
-            apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
-        )
-        self.model = apply_lora_to_model(self.model, lora_config)
+        if not use_base_model:
+            # Apply LoRA configuration
+            print("🔗 Applying LoRA configuration...")
+            lora_cfg = self.config["lora"]
+            lora_config = LoRAConfig(
+                rank=lora_cfg["rank"],
+                alpha=lora_cfg["alpha"],
+                dropout=0.0,  # No dropout during inference
+                target_modules=lora_cfg["target_modules"],
+                apply_to_vision_encoder=lora_cfg["apply_to_vision_encoder"],
+                apply_to_text_encoder=lora_cfg["apply_to_text_encoder"],
+                apply_to_geometry_encoder=lora_cfg["apply_to_geometry_encoder"],
+                apply_to_detr_encoder=lora_cfg["apply_to_detr_encoder"],
+                apply_to_detr_decoder=lora_cfg["apply_to_detr_decoder"],
+                apply_to_mask_decoder=lora_cfg["apply_to_mask_decoder"],
+            )
+            self.model = apply_lora_to_model(self.model, lora_config)
 
-        # Load LoRA weights
-        print(f"💾 Loading LoRA weights from {weights_path}...")
-        load_lora_weights(self.model, weights_path)
+            # Load LoRA weights
+            print(f"💾 Loading LoRA weights from {weights_path}...")
+            load_lora_weights(self.model, weights_path)
 
         self.model.to(self.device)
         self.model.eval()
@@ -183,7 +192,10 @@ class SAM3LoRAInference:
         # because PostProcessImage may have additional filtering logic
         self.use_manual_postprocess = True
 
-        print("✅ SAM3 + LoRA ready for inference!\n")
+        if use_base_model:
+            print("✅ SAM3 native model ready for inference!\n")
+        else:
+            print("✅ SAM3 + LoRA ready for inference!\n")
 
     def create_datapoint(self, pil_image: PILImage.Image, text_prompts: List[str]) -> Datapoint:
         """
@@ -762,6 +774,12 @@ def main():
         default="/home/model/sam3_pth/sam3pt/sam3.pt",
         help="Path to SAM3 base model checkpoint (optional, will use local path if available)"
     )
+    parser.add_argument(
+        "--base-model",
+        action="store_true",
+        default=False,
+        help="Use native SAM3 model without LoRA (skip LoRA weights loading)"
+    )
 
     args = parser.parse_args()
 
@@ -772,7 +790,8 @@ def main():
         resolution=args.resolution,
         detection_threshold=args.threshold,
         nms_iou_threshold=args.nms_iou,
-        checkpoint_path=args.checkpoint
+        checkpoint_path=args.checkpoint,
+        use_base_model=args.base_model
     )
 
     # Run inference - choose mode based on input
