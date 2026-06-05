@@ -249,7 +249,7 @@ class GeometryEncoderWrapper(nn.Module):
         prompt_embeds = ge.prompt_layer_norm(ge.final_proj(prompt_embeds))
 
         prompt_attention_mask = create_bidirectional_mask(
-            config=ge.config, input_embeds=prompt_embeds, attention_mask=prompt_mask
+            config=ge.config, inputs_embeds=prompt_embeds, attention_mask=prompt_mask
         )
 
         for layer in ge.layers:
