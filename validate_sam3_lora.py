@@ -241,6 +241,71 @@ class COCOSegmentDataset(Dataset):
         )
 
 
+def compute_dice_from_predictions(predictions_list, image_ids, dataset, prob_threshold=0.3, nms_iou_threshold=0.7):
+    """
+    Compute Dice coefficient between predicted masks and ground truth.
+    Uses greedy matching to pair predictions with GT, then computes Dice per pair.
+    """
+    all_dice = []
+
+    for img_id, preds in zip(image_ids, predictions_list):
+        if preds is None or len(preds.get('pred_logits', [])) == 0:
+            continue
+
+        datapoint = dataset[img_id]
+        gt_masks = []
+        for obj in datapoint.images[0].objects:
+            if obj.segment is not None:
+                gt_masks.append(obj.segment.float())
+
+        if len(gt_masks) == 0:
+            continue
+
+        gt_tensor = torch.stack([torch.nn.functional.interpolate(m.unsqueeze(0).unsqueeze(0), size=(288, 288), mode='nearest').squeeze() for m in gt_masks])
+
+        logits = preds['pred_logits']
+        masks = preds['pred_masks']
+        boxes = preds['pred_boxes']
+
+        filtered_masks, filtered_scores, _ = apply_sam3_nms(
+            pred_logits=logits, pred_masks=masks, pred_boxes=boxes,
+            prob_threshold=prob_threshold, nms_iou_threshold=nms_iou_threshold
+        )
+
+        if len(filtered_masks) == 0:
+            continue
+
+        pred_binary = (filtered_masks > 0.5).float()
+        G = len(gt_tensor)
+        P = len(pred_binary)
+
+        intersection = torch.einsum('pa,ga->pg', pred_binary.view(P, -1), gt_tensor.view(G, -1))
+        pred_area = pred_binary.view(P, -1).sum(1)
+        gt_area = gt_tensor.view(G, -1).sum(1)
+        union = pred_area.unsqueeze(1) + gt_area.unsqueeze(0) - intersection
+        iou = intersection / (union + 1e-6)
+
+        matched_dice = []
+        used_pred = set()
+        for g in range(G):
+            iou_g = iou[:, g].clone()
+            for p in used_pred:
+                iou_g[p] = -1
+            best_p = iou_g.argmax().item()
+            best_iou = iou_g[best_p].item()
+            if best_iou > 0.01:
+                used_pred.add(best_p)
+                inter = intersection[best_p, g].item()
+                p_area = pred_area[best_p].item()
+                g_area = gt_area[g].item()
+                dice = 2 * inter / (p_area + g_area + 1e-6)
+                matched_dice.append(dice)
+
+        all_dice.extend(matched_dice)
+
+    return all_dice
+
+
 def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.15):
     """
     Merge overlapping masks that likely represent the same object (e.g., crack segments).
@@ -816,7 +881,8 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
     model = build_sam3_image_model(
         device=device.type,
         compile=False,
-        load_from_HF=True,
+        load_from_HF=False,
+        checkpoint_path="/home/model/sam3_pth/sam3pt/sam3.pt",
         bpe_path="sam3/assets/bpe_simple_vocab_16e6.txt.gz",
         eval_mode=False
     )
@@ -930,7 +996,7 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=4,  # Enable parallel data loading
+        num_workers=0,  # Enable parallel data loading
         pin_memory=True  # Faster GPU transfer
     )
 
@@ -1027,6 +1093,20 @@ def validate(config_path, weights_path, val_data_dir, num_samples=None,
         print(f"\n[INFO] Total predictions after SAM3 NMS filtering: {len(coco_predictions)}")
 
     if len(coco_predictions) > 0:
+        # ========== Dice 计算 ==========
+        print("\n" + "="*80)
+        print("DICE COEFFICIENT EVALUATION")
+        print("="*80)
+        dice_scores = compute_dice_from_predictions(all_predictions, all_image_ids, val_ds, prob_threshold, nms_iou)
+        if dice_scores:
+            print(f"Dice (mean):   {np.mean(dice_scores):.4f}")
+            print(f"Dice (std):    {np.std(dice_scores):.4f}")
+            print(f"Dice (max):    {np.max(dice_scores):.4f}")
+            print(f"Dice (min):    {np.min(dice_scores):.4f}")
+            print(f"Dice (median): {np.median(dice_scores):.4f}")
+        else:
+            print("No valid Dice pairs found.")
+
         # Save temporary files for COCO evaluation
         import tempfile
         import os
