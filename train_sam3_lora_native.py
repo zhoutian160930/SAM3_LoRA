@@ -785,7 +785,8 @@ class SAM3TrainerNative:
         # Determine checkpoint path
         # Priority: 1. command line argument, 2. config file, 3. default local path, 4. HuggingFace
         if checkpoint_path is None:
-            checkpoint_path = self.config.get("model", {}).get("checkpoint_path")
+            model_cfg = self.config.get("model", {})
+            checkpoint_path = model_cfg.get("name") or model_cfg.get("checkpoint_path")
         
         if checkpoint_path is None:
             # Try default local path first
@@ -1285,9 +1286,9 @@ Examples:
     parser.add_argument(
         "--checkpoint",
         type=str,
-        default="/home/model/sam3_pth/sam3pt/sam3.pt",
+        default=None,
         help="Path to SAM3 checkpoint file (e.g., sam3.pt). "
-             "If not provided, will try: 1) config file, 2) /home/data-1/yjs/niu/code/sam3/pth/sam3.pt, 3) download from HuggingFace"
+             "If not provided, will try: 1) config file (model.name), 2) /home/data-1/yjs/niu/code/sam3/pth/sam3.pt, 3) download from HuggingFace"
     )
     parser.add_argument(
         "--device",
