@@ -54,12 +54,13 @@ src/AGENTS.md
 script/
 export/AGENTS.md
 configs/
-build_mixed_balanced.py
 convert_pt_to_safetensors.py
 dataset/
+sam3_lora/AGENTS.md
+build_mixed_balanced.py
 eval_box_prompted.py
 merge_cover_to_mixed.py
-sam3_lora/AGENTS.md
+"\346\225\260\346\215\256\351\233\206\347\224\237\346\210\220_\347\224\237\346\210\220\346\225\260\346\215\256/"
 # Data
 /data/
 datasets/
