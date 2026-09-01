@@ -248,9 +248,15 @@ class GeometryEncoderWrapper(nn.Module):
 
         prompt_embeds = ge.prompt_layer_norm(ge.final_proj(prompt_embeds))
 
-        prompt_attention_mask = create_bidirectional_mask(
-            config=ge.config, inputs_embeds=prompt_embeds, attention_mask=prompt_mask
-        )
+        # transformers v5 renamed the kwarg inputs_embeds -> input_embeds
+        try:
+            prompt_attention_mask = create_bidirectional_mask(
+                config=ge.config, input_embeds=prompt_embeds, attention_mask=prompt_mask
+            )
+        except TypeError:
+            prompt_attention_mask = create_bidirectional_mask(
+                config=ge.config, inputs_embeds=prompt_embeds, attention_mask=prompt_mask
+            )
 
         for layer in ge.layers:
             prompt_embeds = layer(

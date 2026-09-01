@@ -25,7 +25,7 @@ from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
 from sam3.train.data.sam3_image_dataset import Datapoint, Image, Object, FindQueryLoaded, InferenceMetadata
-from sam3.model.box_ops import box_xywh_to_xyxy
+from sam3.model.box_ops import box_xywh_to_xyxy, box_xyxy_to_cxcywh
 from lora_layers import LoRAConfig, apply_lora_to_model, load_lora_weights, count_parameters
 
 from torchvision.transforms import v2
@@ -186,39 +186,36 @@ class COCOSegmentDataset(Dataset):
             size=(self.resolution, self.resolution)
         )
 
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
-        from collections import defaultdict
-
-        # Group object IDs by their class name
-        class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[class_name.lower()].append(obj.object_id)
-
-        # Create one query per category
+        # Construct Queries - BOX-PROMPTED mode (one query per GT object).
+        # Matches training/deployment (box -> mask). Eval uses clean GT boxes
+        # (no jitter). obj.bbox here is normalized XYXY, convert to CxCyWH
+        # (same format as infer_sam input_bbox).
         queries = []
-        if len(class_to_object_ids) > 0:
-            for query_text, obj_ids in class_to_object_ids.items():
+        if len(objects) > 0:
+            for obj, class_name in zip(objects, object_class_names):
+                box_cxcywh = box_xyxy_to_cxcywh(obj.bbox.unsqueeze(0)).squeeze(0)
                 query = FindQueryLoaded(
-                    query_text=query_text,
+                    query_text=class_name.lower(),
                     image_id=0,
-                    object_ids_output=obj_ids,
+                    object_ids_output=[obj.object_id],
                     is_exhaustive=True,
                     query_processing_order=0,
+                    input_bbox=box_cxcywh,
+                    input_bbox_label=torch.tensor([1], dtype=torch.long),
                     inference_metadata=InferenceMetadata(
                         coco_image_id=img_id,
                         original_image_id=img_id,
                         original_category_id=0,
                         original_size=(orig_h, orig_w),
-                        object_id=-1,
+                        object_id=obj.object_id,
                         frame_index=-1
                     )
                 )
                 queries.append(query)
         else:
-            # No annotations: create a single generic query
+            # No GT objects: emit a single text-only query (no box) as fallback.
             query = FindQueryLoaded(
-                query_text="object",
+                query_text="transparent object",
                 image_id=0,
                 object_ids_output=[],
                 is_exhaustive=True,

@@ -1,102 +1,183 @@
-# SAM3 LoRA Training Configuration
-# Full LoRA configuration - applies LoRA to ALL transformer components
-# Use this for maximum adaptation capacity (more trainable parameters)
+# # SAM3 LoRA Training Configuration
+# # Full LoRA configuration - applies LoRA to ALL transformer components
+# # Use this for maximum adaptation capacity (more trainable parameters)
+
+# # Model settings
+# model:
+#   name: "/home/model/sam3_pth/sam3pt/sam3.pt"
+#   cache_dir: null
+
+# # LoRA settings
+# lora:
+#   rank: 16                   # Reduced from 64 to avoid OOM
+#   alpha: 32                  # 2x rank (scaling factor)
+#   dropout: 0.1               # Some dropout for regularization
+
+#   # Target modules for SAM3 architecture
+#   # SAM3 uses different naming conventions than standard transformers:
+#   #
+#   # VISION BACKBONE (ViT-style):
+#   #   - "qkv"    : Fused Q/K/V projection (backbone.vision_backbone.trunk.blocks.X.attn.qkv)
+#   #   - "proj"   : Attention output projection (backbone.vision_backbone.trunk.blocks.X.attn.proj)
+#   #   - "fc1"    : MLP first layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc1)
+#   #   - "fc2"    : MLP second layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc2)
+#   #
+#   # LANGUAGE BACKBONE (CLIP-style):
+#   #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
+#   #   - "out_proj" : Attention output projection
+#   #   - "c_fc"   : MLP first layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_fc)
+#   #   - "c_proj" : MLP second layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_proj)
+#   #
+#   # TRANSFORMER ENCODER/DECODER:
+#   #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
+#   #   - "out_proj" : Attention output projection
+#   #   - "linear1" : FFN first layer (transformer.encoder/decoder.layers.X.linear1)
+#   #   - "linear2" : FFN second layer (transformer.encoder/decoder.layers.X.linear2)
+#   #
+#   target_modules:
+#     # Standard attention projections (for replaced MultiheadAttention modules)
+#     - "q_proj"
+#     - "k_proj"
+#     - "v_proj"
+#     - "out_proj"
+#     # Vision backbone (ViT-style)
+#     - "qkv"                  # Fused Q/K/V projection in vision backbone
+#     - "proj"                 # Output projection in vision backbone attention
+#     - "fc1"                  # Vision backbone MLP first layer
+#     - "fc2"                  # Vision backbone MLP second layer
+#     # Language backbone (CLIP-style)
+#     - "c_fc"                 # Language backbone MLP first layer
+#     - "c_proj"               # Language backbone MLP second layer
+#     # Transformer encoder/decoder FFN
+#     - "linear1"              # Transformer FFN first layer
+#     - "linear2"              # Transformer FFN second layer
+
+#   # Apply LoRA to ALL components for maximum adaptation
+#   apply_to_vision_encoder: false    # Vision backbone (ViT)
+#   apply_to_text_encoder: false      # Language backbone (CLIP text encoder)
+#   apply_to_geometry_encoder: false  # Geometry encoder for prompts
+#   apply_to_detr_encoder: false      # DETR-style transformer encoder
+#   apply_to_detr_decoder: false    # DETR-style transformer decoder
+#   apply_to_mask_decoder: true      # Mask prediction head
+
+# # Training settings
+# training:
+#   data_dir: "/root/SAM3_LoRA/dataset/liupo/"  # Root directory containing train/valid/test folders with COCO annotations
+#   batch_size: 8      # Increased from 1 to reduce gradient variance
+#   num_workers: 0        # Set to 0 to avoid shared memory issues (use main process only)
+
+#   learning_rate: 2e-4      # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+#   weight_decay: 0.01
+#   adam_beta1: 0.9
+#   adam_beta2: 0.999
+#   adam_epsilon: 1e-8
+#   max_grad_norm: 1.0
+
+#   num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
+#   warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
+#   lr_scheduler: "cosine"
+
+#   logging_steps: 10
+#   eval_steps: 100       # More frequent validation (from 500)
+#   save_steps: 100       # More frequent checkpoints (from 1000)
+#   save_total_limit: 5   # Keep more checkpoints
+
+#   mixed_precision: "bf16"    # Use bfloat16 if available
+#   seed: 42
+#   gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+
+# output:
+#   output_dir: "/root/SAM3_LoRA/dataset/liupo/weight/r16a32/"
+#   logging_dir: "/root/SAM3_LoRA/dataset/liupo/weight/r16a32/logs"
+#   save_lora_only: true
+#   push_to_hub: false
+#   hub_model_id: null
+
+# evaluation:
+#   metric: "iou"
+#   save_predictions: false
+#   compute_metrics_during_training: true
+
+# hardware:
+#   device: "cuda"
+#   dataloader_pin_memory: true
+#   use_compile: false
+
+
+
+# SAM3 LoRA Training Configuration - Optimized for Fast Convergence on Small Datasets
+# 核心策略：仅微调图像编码器注意力层，最大化有效学习信号，最小化过拟合风险
 
 # Model settings
 model:
   name: "/home/model/sam3_pth/sam3pt/sam3.pt"
+  # name: "/home/model/work/SAM3_LoRA/weight_output/trans10k/weight_megred/sam3_lora_r16a32.pt"
   cache_dir: null
 
 # LoRA settings
 lora:
-  rank: 32                   # Reduced from 64 to avoid OOM
-  alpha: 64                  # 2x rank (scaling factor)
-  dropout: 0.1               # Some dropout for regularization
+  rank: 16                   # 小数据集最优值，不要改
+  alpha: 32                  # 保持2x rank，SAM3标准配置
+  dropout: 0.2               # 增大到0.2，防止过拟合
 
-  # Target modules for SAM3 architecture
-  # SAM3 uses different naming conventions than standard transformers:
-  #
-  # VISION BACKBONE (ViT-style):
-  #   - "qkv"    : Fused Q/K/V projection (backbone.vision_backbone.trunk.blocks.X.attn.qkv)
-  #   - "proj"   : Attention output projection (backbone.vision_backbone.trunk.blocks.X.attn.proj)
-  #   - "fc1"    : MLP first layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc1)
-  #   - "fc2"    : MLP second layer (backbone.vision_backbone.trunk.blocks.X.mlp.fc2)
-  #
-  # LANGUAGE BACKBONE (CLIP-style):
-  #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
-  #   - "out_proj" : Attention output projection
-  #   - "c_fc"   : MLP first layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_fc)
-  #   - "c_proj" : MLP second layer (backbone.language_backbone.encoder.transformer.resblocks.X.mlp.c_proj)
-  #
-  # TRANSFORMER ENCODER/DECODER:
-  #   - "q_proj", "k_proj", "v_proj" : Attention projections (via MultiheadAttentionLoRA replacement)
-  #   - "out_proj" : Attention output projection
-  #   - "linear1" : FFN first layer (transformer.encoder/decoder.layers.X.linear1)
-  #   - "linear2" : FFN second layer (transformer.encoder/decoder.layers.X.linear2)
-  #
+  # ✅ 只保留图像编码器的注意力层！其他全部删掉！
   target_modules:
-    # Standard attention projections (for replaced MultiheadAttention modules)
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "out_proj"
-    # Vision backbone (ViT-style)
-    - "qkv"                  # Fused Q/K/V projection in vision backbone
-    - "proj"                 # Output projection in vision backbone attention
-    - "fc1"                  # Vision backbone MLP first layer
-    - "fc2"                  # Vision backbone MLP second layer
-    # Language backbone (CLIP-style)
-    - "c_fc"                 # Language backbone MLP first layer
-    - "c_proj"               # Language backbone MLP second layer
-    # Transformer encoder/decoder FFN
-    - "linear1"              # Transformer FFN first layer
-    - "linear2"              # Transformer FFN second layer
+    - "qkv"                  # 图像编码器融合的Q/K/V投影（唯一最重要的层）
+    - "proj"                 # 图像编码器注意力输出投影
 
-  # Apply LoRA to ALL components for maximum adaptation
-  apply_to_vision_encoder: false    # Vision backbone (ViT)
-  apply_to_text_encoder: false      # Language backbone (CLIP text encoder)
-  apply_to_geometry_encoder: false  # Geometry encoder for prompts
-  apply_to_detr_encoder: false      # DETR-style transformer encoder
-  apply_to_detr_decoder: false      # DETR-style transformer decoder
-  apply_to_mask_decoder: true      # Mask prediction head
+  # ✅ 关键开关：只开启图像编码器，关闭所有其他模块！
+  apply_to_vision_encoder: true    # ✅ 必须开启！这是让loss下降的关键
+  apply_to_text_encoder: false     # ❌ 不需要
+  apply_to_geometry_encoder: false # ❌ 不需要
+  apply_to_detr_encoder: false     # ❌ 不需要
+  apply_to_detr_decoder: false     # ❌ 绝对不要开
+  apply_to_mask_decoder: false     # ❌ 绝对不要开
 
 # Training settings
 training:
-  data_dir: "/home/model/work/SAM3_LoRA/dataset/lajiaoyou"  # Root directory containing train/valid/test folders with COCO annotations
-  batch_size: 8      # Increased from 1 to reduce gradient variance
-  num_workers: 0        # Set to 0 to avoid shared memory issues (use main process only)
+  data_dir: "/home/model/work/SAM3_LoRA/dataset/长龙航空餐具/"
+  batch_size: 8                # 单卡24GB完全足够，比2更快收敛
+  num_workers: 0               # 加快数据加载，不要用0
 
-  learning_rate: 1e-4        # Increased from 1e-5 (SAM3 uses 1e-4 to 5e-4 for fine-tuning)
+  learning_rate: 1.5e-4        # ✅ 图像编码器LoRA的黄金学习率
   weight_decay: 0.01
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_epsilon: 1e-8
   max_grad_norm: 1.0
 
-  num_epochs: 100       # Reduced from 500 (small dataset overfits quickly)
-  warmup_steps: 200     # Reduced from 1000 (proportional to dataset size)
+  num_epochs: 25               # ✅ 小数据集足够了，再多只会过拟合
+  warmup_steps: 30             # ✅ 大幅减少warmup，让模型尽快开始学习
   lr_scheduler: "cosine"
 
-  logging_steps: 10
-  eval_steps: 100       # More frequent validation (from 500)
-  save_steps: 100       # More frequent checkpoints (from 1000)
-  save_total_limit: 5   # Keep more checkpoints
+  logging_steps: 5
+  eval_steps: 15               # ✅ 每15步验证一次，及时观察loss变化
+  save_steps: 15
+  save_total_limit: 3          # 只保留最好的3个checkpoint
 
-  mixed_precision: "bf16"    # Use bfloat16 if available
+  mixed_precision: "bf16"
   seed: 42
-  gradient_accumulation_steps: 8  # Reduced from 16 (effective batch: 2×8=16)
+  gradient_accumulation_steps: 2  
+
+  # ✅ 必须开启梯度检查点，节省显存
+  gradient_checkpointing: true
 
 output:
-  output_dir: "outputs/lajiaoyou_lora_0604"
-  logging_dir: "outputs/lajiaoyou_lora_0604/logs"
+  output_dir: "/home/model/work/SAM3_LoRA/weight_output/长龙航空餐具/weight_lora_r16a32"
+  logging_dir: "/home/model/work/SAM3_LoRA/weight_output/长龙航空餐具/weight_lora_r16a32/logs"
   save_lora_only: true
   push_to_hub: false
   hub_model_id: null
 
 evaluation:
   metric: "iou"
-  save_predictions: false
+  save_predictions: true       # 保存预测结果，方便分析问题
   compute_metrics_during_training: true
+  # ✅ 必须开启早停，防止过拟合
+  early_stopping:
+    enable: true
+    patience: 3                # 连续3次eval没有提升就停止
+    threshold: 0.001           # 提升小于0.1%视为没有提升
 
 hardware:
   device: "cuda"

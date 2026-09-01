@@ -25,12 +25,20 @@ Multi-GPU Training:
 """
 
 import os
+
+# Must be set before torch import: reduces CUDA fragmentation OOM on
+# box-prompted training (query count varies per batch -> spiky allocations).
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import math
 import yaml
 import json
+import shutil
+from datetime import datetime
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, Sampler
 from torch.utils.data.distributed import DistributedSampler
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -110,8 +118,100 @@ def print_rank0(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def jitter_box(box_cxcywh, scale=0.1, shift=0.1):
+    """Jitter a normalized [cx,cy,w,h] box to simulate detector noise.
+
+    Applies random center shift (fraction of box size) and scale change,
+    then clamps corners to [0, 1] and returns CxCyWH.
+    """
+    cx, cy, w, h = box_cxcywh.tolist()
+    x1, y1, x2, y2 = cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2
+    bw, bh = x2 - x1, y2 - y1
+    x1 = x1 + (torch.rand(1).item() * 2 - 1) * shift * bw
+    x2 = x2 + (torch.rand(1).item() * 2 - 1) * shift * bw
+    y1 = y1 + (torch.rand(1).item() * 2 - 1) * shift * bh
+    y2 = y2 + (torch.rand(1).item() * 2 - 1) * shift * bh
+    s = 1 + (torch.rand(1).item() * 2 - 1) * scale
+    cx2, cy2 = (x1 + x2) / 2, (y1 + y2) / 2
+    nw, nh = (x2 - x1) * s, (y2 - y1) * s
+    x1, y1, x2, y2 = cx2 - nw / 2, cy2 - nh / 2, cx2 + nw / 2, cy2 + nh / 2
+    x1, y1 = max(0.0, x1), max(0.0, y1)
+    x2, y2 = min(1.0, x2), min(1.0, y2)
+    x2 = max(x2, x1 + 1e-4)
+    y2 = max(y2, y1 + 1e-4)
+    return torch.tensor([(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1],
+                        dtype=box_cxcywh.dtype)
+
+
+def compute_source_weights(dataset, alpha=1.0):
+    """Compute per-sample weights from "source__file" name prefixes.
+
+    Weight_i = 1 / count(source_i)^alpha, normalized so sum(weights) == N.
+    alpha=1.0 -> each source contributes equally per epoch (full balancing);
+    alpha=0.5 -> softer balancing; alpha=0 -> original distribution.
+
+    Returns None when filenames don't carry a "source__" prefix.
+    """
+    names = [dataset.images[img_id]['file_name'] for img_id in dataset.image_ids]
+    has_prefix = sum(1 for n in names if "__" in n)
+    if has_prefix < 0.5 * len(names):
+        print_rank0("balanced_source_sampling: most filenames lack 'source__' prefix, "
+                    "falling back to plain shuffling")
+        return None
+
+    from collections import Counter
+    sources = [n.split("__", 1)[0] for n in names]
+    counts = Counter(sources)
+    weights = torch.tensor(
+        [1.0 / (counts[s] ** alpha) for s in sources], dtype=torch.double
+    )
+    weights *= len(weights) / weights.sum()
+
+    n = len(weights)
+    # after normalization sum(weights) == N, so expected draws per source:
+    expected = {s: sum(weights[i].item() for i, src in enumerate(sources) if src == s)
+                for s in counts}
+    print_rank0("balanced_source_sampling: per-source stats "
+                f"(alpha={alpha}, {len(counts)} sources)")
+    for s, c in counts.most_common():
+        print_rank0(f"  {s}: {c} entries -> ~{expected[s]:.0f} draws/epoch "
+                    f"(x{expected[s] / c:.2f})")
+    return weights
+
+
+class DistributedWeightedSampler(Sampler):
+    """DDP-compatible weighted sampler: all ranks draw the same weighted
+    permutation from a shared seed, then take interleaved shards."""
+
+    def __init__(self, weights, num_replicas, rank, seed=42):
+        self.weights = torch.as_tensor(weights, dtype=torch.double)
+        self.num_samples = len(self.weights)
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        # pad total draws to be divisible by num_replicas
+        self.total_size = (self.num_samples + self.num_replicas - 1) // self.num_replicas * self.num_replicas
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed + self.epoch)
+        indices = torch.multinomial(
+            self.weights, self.total_size, replacement=True, generator=g
+        ).tolist()
+        return iter(indices[self.rank:self.total_size:self.num_replicas])
+
+    def __len__(self):
+        return self.total_size // self.num_replicas
+
+
+
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
+
     def __init__(self, data_dir, split="train"):
         """
         Args:
@@ -120,6 +220,7 @@ class COCOSegmentDataset(Dataset):
         """
         self.data_dir = Path(data_dir)
         self.split = split
+        self.is_train = (split == "train")
         self.split_dir = self.data_dir / split
 
         # Load COCO annotations
@@ -150,11 +251,21 @@ class COCOSegmentDataset(Dataset):
         print(f"  Categories: {self.categories}")
 
         self.resolution = 1008
-        self.transform = v2.Compose([
-            v2.ToImage(),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ])
+        # Train-only photometric jitter (geometric flip handled in __getitem__
+        # so box/mask stay in sync with the image).
+        if self.is_train:
+            self.transform = v2.Compose([
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        else:
+            self.transform = v2.Compose([
+                v2.ToImage(),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
 
     def __len__(self):
         return len(self.image_ids)
@@ -171,8 +282,14 @@ class COCOSegmentDataset(Dataset):
         # Resize image
         pil_image = pil_image.resize((self.resolution, self.resolution), PILImage.BILINEAR)
 
-        # Transform to tensor
+        # Transform to tensor (train: includes color jitter)
         image_tensor = self.transform(pil_image)
+
+        # Train-only horizontal flip, synced with boxes/masks:
+        # image/segment flip along W; normalized CxCyWH box: cx -> 1 - cx.
+        do_flip = self.is_train and (torch.rand(1).item() < 0.5)
+        if do_flip:
+            image_tensor = torch.flip(image_tensor, dims=[-1])
 
         # Get annotations for this image
         annotations = self.img_to_anns.get(img_id, [])
@@ -209,6 +326,11 @@ class COCOSegmentDataset(Dataset):
                 h * scale_h / self.resolution,
             ], dtype=torch.float32)
 
+            # Apply synced horizontal flip to box (cx -> 1 - cx)
+            if do_flip:
+                box_tensor = box_tensor.clone()
+                box_tensor[0] = 1.0 - box_tensor[0]
+
             # Handle segmentation mask (polygon or RLE format)
             segment = None
             segmentation = ann.get("segmentation", None)
@@ -238,6 +360,8 @@ class COCOSegmentDataset(Dataset):
                         mode="nearest"
                     )
                     segment = mask_t.squeeze() > 0.5  # [1008, 1008] boolean tensor
+                    if do_flip:
+                        segment = torch.flip(segment, dims=[-1])
 
                 except Exception as e:
                     print(f"Warning: Error processing mask for image {img_id}, ann {i}: {e}")
@@ -257,39 +381,38 @@ class COCOSegmentDataset(Dataset):
             size=(self.resolution, self.resolution)
         )
 
-        # Construct Queries - one per unique category
-        # Each query maps to only the objects of that category
-        from collections import defaultdict
-
-        # Group object IDs by their class name
-        class_to_object_ids = defaultdict(list)
-        for obj, class_name in zip(objects, object_class_names):
-            class_to_object_ids[class_name.lower()].append(obj.object_id)
-
-        # Create one query per category
+        # Construct Queries - BOX-PROMPTED mode (one query per GT object).
+        # Matches deployment (YOLO box -> SAM3 mask). Training boxes are
+        # jittered to simulate detector noise; eval uses clean GT boxes.
+        # obj.bbox is already normalized CxCyWH (same format as infer_sam input_bbox).
         queries = []
-        if len(class_to_object_ids) > 0:
-            for query_text, obj_ids in class_to_object_ids.items():
+        if len(objects) > 0:
+            for obj, class_name in zip(objects, object_class_names):
+                box_cxcywh = obj.bbox.clone()
+                if self.is_train:
+                    box_cxcywh = jitter_box(box_cxcywh, scale=0.1, shift=0.1)
                 query = FindQueryLoaded(
-                    query_text=query_text,
+                    query_text=class_name.lower(),
                     image_id=0,
-                    object_ids_output=obj_ids,
+                    object_ids_output=[obj.object_id],
                     is_exhaustive=True,
                     query_processing_order=0,
+                    input_bbox=box_cxcywh,
+                    input_bbox_label=torch.tensor([1], dtype=torch.long),
                     inference_metadata=InferenceMetadata(
                         coco_image_id=img_id,
                         original_image_id=img_id,
                         original_category_id=0,
                         original_size=(orig_h, orig_w),
-                        object_id=-1,
+                        object_id=obj.object_id,
                         frame_index=-1
                     )
                 )
                 queries.append(query)
         else:
-            # No annotations: create a single generic query
+            # No GT objects: emit a single text-only query (no box) as fallback.
             query = FindQueryLoaded(
-                query_text="object",
+                query_text="transparent object",
                 image_id=0,
                 object_ids_output=[],
                 is_exhaustive=True,
@@ -766,6 +889,7 @@ def create_coco_gt_from_dataset_original_res(dataset, image_ids=None, debug=Fals
 
 class SAM3TrainerNative:
     def __init__(self, config_path, multi_gpu=False, checkpoint_path=None):
+        self.config_path = Path(config_path)
         with open(config_path, "r") as f:
             self.config = yaml.safe_load(f)
 
@@ -947,7 +1071,25 @@ class SAM3TrainerNative:
         train_sampler = None
         val_sampler = None
 
-        if self.multi_gpu:
+        # Optional source-balanced sampling: weights from "source__file"
+        # prefixes (e.g. mixed_balanced), mitigates domain imbalance.
+        if self.config["training"].get("balanced_source_sampling", False):
+            alpha = float(self.config["training"].get("source_weight_alpha", 1.0))
+            weights = compute_source_weights(train_ds, alpha=alpha)
+            if weights is not None:
+                if self.multi_gpu:
+                    train_sampler = DistributedWeightedSampler(
+                        weights,
+                        num_replicas=self.world_size,
+                        rank=get_rank(),
+                        seed=self.config["training"].get("seed", 42),
+                    )
+                else:
+                    train_sampler = WeightedRandomSampler(
+                        weights, num_samples=len(train_ds), replacement=True
+                    )
+
+        if self.multi_gpu and train_sampler is None:
             train_sampler = DistributedSampler(
                 train_ds,
                 num_replicas=self.world_size,
@@ -1030,6 +1172,55 @@ class SAM3TrainerNative:
         out_dir = Path(self.config["output"]["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Archive the executed config into output_dir (timestamped, rank-0 only)
+        if is_main_process() and self.config_path.exists():
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dst = out_dir / f"{self.config_path.stem}_{stamp}.yaml"
+            shutil.copy2(self.config_path, dst)
+            print_rank0(f"Config archived to: {dst}")
+
+        # Mixed precision (bf16) to cut activation memory ~2x (box-prompted
+        # training has many queries per image, so memory is tight).
+        use_amp = self.device.type == "cuda"
+
+        # LR schedule: linear warmup -> cosine decay to ~0 (per optimizer step).
+        # Implements config keys lr_scheduler/warmup_steps (previously ignored).
+        warmup_steps = int(self.config["training"].get("warmup_steps", 0))
+        total_steps = max(1, len(train_loader) * epochs)
+        sched_name = self.config["training"].get("lr_scheduler", "cosine")
+        if sched_name == "cosine":
+            def lr_lambda(step):
+                if step < warmup_steps:
+                    return (step + 1) / max(1, warmup_steps)
+                progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+                return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
+        else:
+            lr_lambda = None
+        if lr_lambda is not None:
+            self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+            print_rank0(f"LR schedule: {sched_name}, warmup={warmup_steps} steps, "
+                        f"total={total_steps} steps")
+        else:
+            self.scheduler = None
+
+        # Gradient clipping (previously ignored config key max_grad_norm)
+        max_grad_norm = float(self.config["training"].get("max_grad_norm", 0.0))
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+        # Early stopping (previously ignored config block evaluation.early_stopping)
+        es_cfg = self.config.get("evaluation", {}).get("early_stopping", {})
+        es_enable = bool(es_cfg.get("enable", False)) and has_validation
+        es_patience = int(es_cfg.get("patience", 5))
+        es_threshold = float(es_cfg.get("threshold", 0.0))
+        epochs_no_improve = 0
+        if es_enable:
+            print_rank0(f"Early stopping: patience={es_patience}, threshold={es_threshold}")
+
+        # Fresh stats file per run (was append-mode, mixing concurrent runs)
+        stats_path = out_dir / "val_stats.json"
+        if is_main_process():
+            stats_path.write_text("")
+
         for epoch in range(epochs):
             # Set epoch for distributed sampler (required for proper shuffling)
             if self.multi_gpu and train_sampler is not None:
@@ -1048,7 +1239,11 @@ class SAM3TrainerNative:
 
                 # Forward pass
                 # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
-                outputs_list = self.model(input_batch)
+                if use_amp:
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        outputs_list = self.model(input_batch)
+                else:
+                    outputs_list = self.model(input_batch)
 
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
@@ -1079,7 +1274,11 @@ class SAM3TrainerNative:
 
                 # Compute loss using Sam3LossWrapper
                 # This handles num_boxes calculation and proper weighting
-                loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                if use_amp:
+                    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                        loss_dict = self.loss_wrapper(outputs_list, find_targets)
+                else:
+                    loss_dict = self.loss_wrapper(outputs_list, find_targets)
 
                 # Extract total loss
                 total_loss = loss_dict[CORE_LOSS_KEY]
@@ -1087,14 +1286,23 @@ class SAM3TrainerNative:
                 # Backward
                 self.optimizer.zero_grad()
                 total_loss.backward()
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, max_grad_norm)
                 self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
                 # Track training loss
                 train_losses.append(total_loss.item())
-                pbar.set_postfix({"loss": total_loss.item()})
+                cur_lr = self.optimizer.param_groups[0]["lr"]
+                pbar.set_postfix({"loss": total_loss.item(), "lr": f"{cur_lr:.2e}"})
 
             # Calculate average training loss for this epoch
             avg_train_loss = sum(train_losses) / len(train_losses) if train_losses else 0.0
+
+            # Release the training-phase cache before validation so the val
+            # forward doesn't stack on top of the full training peak.
+            torch.cuda.empty_cache()
 
             # Validation (only compute loss - no metrics, like SAM3)
             if has_validation and val_loader is not None:
@@ -1109,7 +1317,11 @@ class SAM3TrainerNative:
                         input_batch = move_to_device(input_batch, self.device)
 
                         # Forward pass
-                        outputs_list = self.model(input_batch)
+                        if use_amp:
+                            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                                outputs_list = self.model(input_batch)
+                        else:
+                            outputs_list = self.model(input_batch)
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
@@ -1149,6 +1361,9 @@ class SAM3TrainerNative:
 
                 print_rank0(f"\nEpoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
 
+                # Capture pre-update best for early-stopping bookkeeping
+                prev_best = best_val_loss
+
                 # Save models based on validation loss (only on rank 0)
                 if is_main_process():
                     # Get underlying model from DDP wrapper
@@ -1161,12 +1376,24 @@ class SAM3TrainerNative:
                         print(f"✓ New best model saved (val_loss: {avg_val_loss:.6f})")
 
                     # Log to file
-                    with open(out_dir / "val_stats.json", "a") as f:
+                    with open(stats_path, "a") as f:
                         f.write(json.dumps({
                             "epoch": epoch + 1,
                             "train_loss": avg_train_loss,
                             "val_loss": avg_val_loss
                         }) + "\n")
+
+                # Early stopping: reset counter only on meaningful improvement.
+                # Compares against the PRE-update best; avg_val_loss is
+                # all-reduced, so all ranks decide identically.
+                if avg_val_loss < prev_best - es_threshold:
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if es_enable and epochs_no_improve >= es_patience:
+                        print_rank0(f"\n⏹ Early stopping triggered at epoch {epoch+1} "
+                                    f"(no improvement > {es_threshold} for {es_patience} epochs)")
+                        break
 
                 torch.cuda.empty_cache()
 
@@ -1177,6 +1404,7 @@ class SAM3TrainerNative:
                 if is_main_process():
                     model_to_save = self.model.module if self.multi_gpu else self.model
                     save_lora_weights(model_to_save, str(out_dir / "last_lora_weights.pt"))
+                torch.cuda.empty_cache()
 
         # Synchronize before final save
         if self.multi_gpu:
@@ -1200,7 +1428,6 @@ class SAM3TrainerNative:
                 print(f"{'='*80}")
             else:
                 # If no validation, copy last to best
-                import shutil
                 last_path = out_dir / "last_lora_weights.pt"
                 best_path = out_dir / "best_lora_weights.pt"
                 if last_path.exists():

@@ -25,7 +25,13 @@ import os
 import regex as re
 import torch
 
-from transformers import CLIPTokenizerFast, Sam3Config, Sam3ImageProcessor, Sam3Model, Sam3Processor
+from transformers import CLIPTokenizerFast, Sam3Config, Sam3Model, Sam3Processor
+
+# transformers v5 removed slow image processors; fall back across versions
+try:
+    from transformers import Sam3ImageProcessor
+except ImportError:
+    from transformers import Sam3ImageProcessorFast as Sam3ImageProcessor
 from transformers.utils import logging
 
 

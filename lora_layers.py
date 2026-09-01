@@ -383,6 +383,12 @@ def apply_lora_to_model(model: nn.Module, config: LoRAConfig) -> nn.Module:
             return False
         if ("detr_decoder" in module_name or "transformer.decoder" in module_name) and not config.apply_to_detr_decoder:
             return False
+        # Native SAM3 names its mask decoder "segmentation_head" (HF name is
+        # "mask_decoder"); dot_prod_scoring is the decoder-side query-text
+        # scoring head. Gate all three under apply_to_mask_decoder.
+        # if (("mask_decoder" in module_name or "segmentation_head" in module_name
+        #       or "dot_prod_scoring" in module_name)
+        #         and not config.apply_to_mask_decoder):
         if "mask_decoder" in module_name and not config.apply_to_mask_decoder:
             return False
         return True

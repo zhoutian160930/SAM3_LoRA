@@ -85,7 +85,7 @@ def draw_results(image, results, input_boxes=None):
 
 def main():
     parser = argparse.ArgumentParser(description="HF 格式 SAM3 YOLO-box 提示测试")
-    parser.add_argument("--model-path", default="/root/sam3weight/base_v2/")
+    parser.add_argument("--model-path", default="/root/SAM3_LoRA/dataset/weight/六婆/merge_safetensor/")
     parser.add_argument("--img-dir", default="/root/SAM3_LoRA/dataset/liupo/test/")
     parser.add_argument("--label-dir", default="/root/SAM3_LoRA/dataset/liupo/test_labels/")
     parser.add_argument("--out-dir", default="/root/SAM3_LoRA/dataset/liupo/hf_test_output/")

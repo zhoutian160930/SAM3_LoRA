@@ -126,16 +126,16 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lora",
-        default="/home/model/work/SAM3_LoRA/outputs/sam3_lora_full_1/best_lora_weights.pt",
+        default="/root/SAM3_LoRA/dataset/liupo/weight/r16a32_fast_converge/last_lora_weights.pt",
         help="LoRA 权重文件路径"
     )
     parser.add_argument(
         "--output",
-        default="/home/model/sam3_pth/finetuning_weights/duidie_weights/pytorch/sam3_merged.pt",
+        default="/root/SAM3_LoRA/dataset/liupo/weight/r16a32_fast_converge/sam3_r16a32.pt",
         help="合并后模型的保存路径"
     )
-    parser.add_argument("--rank",  type=int, default=32, help="LoRA rank")
-    parser.add_argument("--alpha", type=int, default=64, help="LoRA alpha")
+    parser.add_argument("--rank",  type=int, default=8, help="LoRA rank")
+    parser.add_argument("--alpha", type=int, default=16, help="LoRA alpha")
     args = parser.parse_args()
 
     merge_lora_into_base(

@@ -47,7 +47,19 @@ experiments/
 logs/
 checkpoints/
 dumps/
-
+weight_output/
+export/
+onnx-models/
+src/AGENTS.md
+script/
+export/AGENTS.md
+configs/
+build_mixed_balanced.py
+convert_pt_to_safetensors.py
+dataset/
+eval_box_prompted.py
+merge_cover_to_mixed.py
+sam3_lora/AGENTS.md
 # Data
 /data/
 datasets/
