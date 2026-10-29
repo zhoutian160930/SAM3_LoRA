@@ -85,3 +85,5 @@ Thumbs.db
 *.tmp
 *.temp
 .hf_home/
+# 负样本（错误区域）权重码图缓存
+.neg_weight_cache/

@@ -54,7 +54,14 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # SAM3 Imports
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.model_misc import SAM3Output
-from sam3.train.loss.loss_fns import IABCEMdetr, Boxes, Masks, CORE_LOSS_KEY
+from sam3.train.loss.loss_fns import (
+    IABCEMdetr,
+    Boxes,
+    Masks,
+    CORE_LOSS_KEY,
+    sigmoid_focal_loss,
+    dice_loss,
+)
 from sam3.train.loss.sam3_loss import Sam3LossWrapper
 from sam3.train.matcher import BinaryHungarianMatcherV2, BinaryOneToManyMatcher
 from sam3.train.data.collator import collate_fn_api
@@ -208,15 +215,158 @@ class DistributedWeightedSampler(Sampler):
         return self.total_size // self.num_replicas
 
 
+# ============================================================================
+# 负样本（错误标注）加权 Mask 损失
+# ============================================================================
+
+class WeightedMasks(Masks):
+    """在 SAM3 原生 Masks 损失上加“错误标注区域”像素权重。
+
+    监督目标仍然是**正确**的 mask，只是让 loss 更关注人容易标错的像素：
+        code=1（错误 mask 多标出来的区域，FP 高发）→ weight_extra
+        code=2（正确 mask 被漏标的区域，FN 高发）  → weight_missed
+        code=0（其余像素）                         → 1.0
+
+    权重码图由 COCOSegmentDataset 生成，经 collate 以
+    targets["neg_weight_codes"]（[B, H, W] uint8，每张图一张）传入，
+    这里按 targets["num_boxes"] 展开成逐实例，与 targets["masks"] 打包顺序对齐。
+
+    没有权重码图时（例如 val 集没配 wrong_ann.json）自动退化为原生 Masks。
+    """
+
+    def __init__(
+        self,
+        weight_dict=None,
+        compute_aux=False,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
+        neg_weight_extra=3.0,
+        neg_weight_missed=3.0,
+        apply_to_dice=False,
+        **kwargs,
+    ):
+        super().__init__(
+            weight_dict=weight_dict,
+            compute_aux=compute_aux,
+            focal_alpha=focal_alpha,
+            focal_gamma=focal_gamma,
+            **kwargs,
+        )
+        self.neg_weight_extra = float(neg_weight_extra)
+        self.neg_weight_missed = float(neg_weight_missed)
+        self.apply_to_dice = bool(apply_to_dice)
+        if "neg_weight_codes" not in self.target_keys:
+            self.target_keys.append("neg_weight_codes")
+
+    def _weight_map(self, codes, size):
+        """uint8 码图 → float 权重图 [N, H, W]。"""
+        if tuple(codes.shape[-2:]) != tuple(size):
+            codes = torch.nn.functional.interpolate(
+                codes.float().unsqueeze(1), size=tuple(size), mode="nearest"
+            ).squeeze(1).to(codes.dtype)
+        w = torch.ones(codes.shape, dtype=torch.float32, device=codes.device)
+        if self.neg_weight_extra != 1.0:
+            w = torch.where(codes == 1, torch.full_like(w, self.neg_weight_extra), w)
+        if self.neg_weight_missed != 1.0:
+            w = torch.where(codes == 2, torch.full_like(w, self.neg_weight_missed), w)
+        return w
+
+    def get_loss(self, outputs, targets, indices, num_boxes):
+        codes = targets.get("neg_weight_codes", None)
+        if codes is None:
+            # 没有负样本权重 → 原生行为
+            return super().get_loss(
+                outputs=outputs, targets=targets, indices=indices, num_boxes=num_boxes
+            )
+
+        assert "pred_masks" in outputs
+        src_masks = outputs["pred_masks"]
+        if targets["masks"] is None:
+            zero = torch.tensor(0.0, device=src_masks.device)
+            return {"loss_mask": zero, "loss_dice": zero.clone()}
+
+        target_masks = (
+            targets["masks"] if indices[2] is None else targets["masks"][indices[2]]
+        )
+        target_masks = target_masks.to(src_masks)
+        keep = (
+            targets["is_valid_mask"]
+            if indices[2] is None
+            else targets["is_valid_mask"][indices[2]]
+        )
+        src_masks = src_masks[(indices[0], indices[1])]
+
+        # 码图已经是【逐实例】顺序（collate 时按每图实例数展开），
+        # 与 targets["masks"] 的打包顺序一致；数量对不上时退化为不加权，避免越界。
+        n_targets = targets["masks"].shape[0]
+        if codes.shape[0] != n_targets:
+            if not getattr(self, "_warned_mismatch", False):
+                print(f"[WeightedMasks] 码图数量({codes.shape[0]}) != 目标数({n_targets})，"
+                      f"本次不加权（退化为原生 Masks）")
+                self._warned_mismatch = True
+            codes = torch.zeros(
+                (n_targets,) + tuple(codes.shape[1:]), dtype=codes.dtype, device=codes.device
+            )
+        if indices[2] is not None:
+            codes = codes[indices[2]]
+
+        src_masks = src_masks[keep]
+        target_masks = target_masks[keep]
+        codes = codes[keep]
+
+        if target_masks.shape[0] == 0:
+            zero = torch.zeros((), device=src_masks.device)
+            return {"loss_mask": zero, "loss_dice": zero.clone()}
+
+        mask_hw = target_masks.shape[-2:]
+
+        # 与原生实现一致：上采样到 GT 尺寸（bf16 不支持双线性插值）
+        if len(src_masks.shape) == 3:
+            src_masks = src_masks[:, None]
+        if src_masks.dtype == torch.bfloat16:
+            src_masks = src_masks.to(dtype=torch.float32)
+        src_masks = torch.nn.functional.interpolate(
+            src_masks, size=mask_hw, mode="bilinear", align_corners=False
+        )
+        src_masks = src_masks[:, 0].flatten(1)
+        target_masks = target_masks.flatten(1)
+
+        w = self._weight_map(codes, mask_hw).flatten(1).to(src_masks.dtype)
+
+        # 权重化 focal：w 全 1 时与原生 sigmoid_focal_loss(reduce=True) 完全等价
+        focal = sigmoid_focal_loss(
+            src_masks,
+            target_masks,
+            1.0,
+            alpha=self.focal_alpha,
+            gamma=self.focal_gamma,
+            reduce=False,
+        )
+        loss_mask = (w * focal).sum() / (num_boxes * src_masks.shape[1])
+
+        if self.apply_to_dice:
+            prob = src_masks.sigmoid()
+            numerator = (w * prob * target_masks).sum(1)
+            denominator = (w * prob).sum(1) + (w * target_masks).sum(1)
+            loss_dice = (1 - (numerator * 2 + 1) / (denominator + 1)).sum() / num_boxes
+        else:
+            loss_dice = dice_loss(src_masks, target_masks, num_boxes)
+
+        return {"loss_mask": loss_mask, "loss_dice": loss_dice}
+
 
 class COCOSegmentDataset(Dataset):
     """Dataset class for COCO format segmentation data"""
 
-    def __init__(self, data_dir, split="train"):
+    def __init__(self, data_dir, split="train", neg_ann_file=None, neg_cache=True):
         """
         Args:
             data_dir: Root directory containing train/valid/test folders
             split: One of 'train', 'valid', 'test'
+            neg_ann_file: 与 _annotations.coco.json 同目录的错误标注文件名
+                （如 "wrong_ann.json"）。仅用于生成“错误区域”权重图，
+                监督目标仍然是 _annotations.coco.json 里的正确 mask。None 表示关闭。
+            neg_cache: 是否缓存 1008×1008 的权重码图（.neg_weight_cache/*.npy）
         """
         self.data_dir = Path(data_dir)
         self.split = split
@@ -251,6 +401,33 @@ class COCOSegmentDataset(Dataset):
         print(f"  Categories: {self.categories}")
 
         self.resolution = 1008
+
+        # ------------------------------------------------------------------
+        # 负样本（错误标注）监督：读取同目录下的错误标注文件
+        #   只用来构造“错误区域”权重图，训练目标仍是正确 mask
+        # ------------------------------------------------------------------
+        self.neg_anns = {}
+        self.neg_enabled = bool(neg_ann_file)
+        self.neg_cache_dir = None
+        if self.neg_enabled:
+            neg_path = self.split_dir / neg_ann_file
+            if neg_path.exists():
+                with open(neg_path, "r") as f:
+                    neg_data = json.load(f)
+                neg_id2name = {img["id"]: img["file_name"] for img in neg_data["images"]}
+                for ann in neg_data["annotations"]:
+                    name = neg_id2name.get(ann["image_id"])
+                    if name is None:
+                        continue
+                    self.neg_anns.setdefault(name, []).append(ann)
+                if neg_cache:
+                    self.neg_cache_dir = self.split_dir / ".neg_weight_cache"
+                    self.neg_cache_dir.mkdir(parents=True, exist_ok=True)
+                print(f"  错误标注(负样本): {len(self.neg_anns)} 张图 <- {neg_path.name}")
+            else:
+                print(f"  ⚠️ 未找到错误标注 {neg_path}，本 split 只用正常标注")
+                self.neg_enabled = False
+
         # Train-only photometric jitter (geometric flip handled in __getitem__
         # so box/mask stay in sync with the image).
         if self.is_train:
@@ -269,6 +446,81 @@ class COCOSegmentDataset(Dataset):
 
     def __len__(self):
         return len(self.image_ids)
+
+    # ------------------------------------------------------------------
+    # 负样本（错误标注）相关工具
+    # ------------------------------------------------------------------
+    @staticmethod
+    def decode_segmentation(segmentation, h, w):
+        """polygon / 未压缩 RLE / 压缩 RLE 统一解码为 bool mask (h, w)。"""
+        if isinstance(segmentation, dict):
+            counts = segmentation.get("counts")
+            size = list(segmentation.get("size", [h, w]))
+            if isinstance(counts, list):
+                if counts and sum(counts) == int(size[0]) * int(size[1]):
+                    # 未压缩 RLE：counts 是交替游程长度
+                    rle = mask_utils.frPyObjects({"size": size, "counts": counts}, *size)
+                else:
+                    rle = {"size": size, "counts": bytes(counts)}
+                return mask_utils.decode(rle) > 0
+            if isinstance(counts, str):
+                return mask_utils.decode({"size": size, "counts": counts.encode("ascii")}) > 0
+            return mask_utils.decode(segmentation) > 0
+        if isinstance(segmentation, list):
+            rles = mask_utils.frPyObjects(segmentation, h, w)
+            return mask_utils.decode(mask_utils.merge(rles)) > 0
+        raise TypeError(f"Unknown segmentation type: {type(segmentation)}")
+
+    @classmethod
+    def _union_masks(cls, anns, h, w):
+        """把一组标注的 mask 取并集（instance 无关，只看前景覆盖）。"""
+        union = np.zeros((h, w), dtype=bool)
+        for ann in anns:
+            seg = ann.get("segmentation")
+            if not seg:
+                continue
+            try:
+                union |= cls.decode_segmentation(seg, h, w)
+            except Exception:
+                continue
+        return union
+
+    def _neg_weight_code(self, img_info):
+        """生成错误区域权重码图 [res, res] uint8：0=正常, 1=错误多标, 2=漏标。"""
+        if not self.neg_enabled:
+            return None
+        name = img_info["file_name"]
+        wrong_anns = self.neg_anns.get(name)
+        if not wrong_anns:
+            return None
+
+        cache_path = None
+        if self.neg_cache_dir is not None:
+            cache_path = self.neg_cache_dir / f"{Path(name).stem}.npy"
+            if cache_path.exists():
+                return torch.from_numpy(np.load(cache_path).copy())
+
+        h = int(img_info.get("height") or 0)
+        w = int(img_info.get("width") or 0)
+        if h <= 0 or w <= 0:
+            return None
+
+        normal = self._union_masks(self.img_to_anns.get(img_info["id"], []), h, w)
+        wrong = self._union_masks(wrong_anns, h, w)
+        codes = np.zeros((h, w), dtype=np.uint8)
+        codes[wrong & ~normal] = 1   # 错误标注多出来的像素（FP 高发）
+        codes[normal & ~wrong] = 2   # 正确标注被漏掉的像素（FN 高发）
+
+        # 与 mask 一致：用 nearest 缩放到模型分辨率
+        codes_small = np.asarray(
+            PILImage.fromarray(codes).resize(
+                (self.resolution, self.resolution), PILImage.NEAREST
+            )
+        )
+        if cache_path is not None:
+            np.save(cache_path, codes_small)
+        # .copy() 保证 tensor 可写（np.load 返回的数组是只读的）
+        return torch.from_numpy(codes_small.copy())
 
     def __getitem__(self, idx):
         img_id = self.image_ids[idx]
@@ -337,20 +589,8 @@ class COCOSegmentDataset(Dataset):
 
             if segmentation:
                 try:
-                    # Check if it's RLE format (dict) or polygon format (list)
-                    if isinstance(segmentation, dict):
-                        # RLE format: {"counts": "...", "size": [h, w]}
-                        mask_np = mask_utils.decode(segmentation)
-                    elif isinstance(segmentation, list):
-                        # Polygon format: [[x1, y1, x2, y2, ...], ...]
-                        # Convert polygon to RLE, then decode
-                        rles = mask_utils.frPyObjects(segmentation, orig_h, orig_w)
-                        rle = mask_utils.merge(rles)
-                        mask_np = mask_utils.decode(rle)
-                    else:
-                        print(f"Warning: Unknown segmentation format: {type(segmentation)}")
-                        segment = None
-                        continue
+                    # polygon / 未压缩 RLE / 压缩 RLE 统一走同一个解码器
+                    mask_np = self.decode_segmentation(segmentation, orig_h, orig_w)
 
                     # Resize mask to model resolution
                     mask_t = torch.from_numpy(mask_np).float().unsqueeze(0).unsqueeze(0)
@@ -428,11 +668,22 @@ class COCOSegmentDataset(Dataset):
             )
             queries.append(query)
 
-        return Datapoint(
+        return_data = Datapoint(
             find_queries=queries,
             images=[image_obj],
             raw_images=[pil_image]
         )
+
+        # 负样本（错误标注）权重码图：每张图一张，collate 时单独收集
+        # （Datapoint 是 sam3 的 dataclass，这里用动态属性避免改 vendored 源码）
+        if self.neg_enabled:
+            neg_code = self._neg_weight_code(img_info)
+            if neg_code is not None:
+                if do_flip:
+                    neg_code = torch.flip(neg_code, dims=[-1])
+                return_data.neg_weight_code = neg_code
+
+        return return_data
 
 
 def merge_overlapping_masks(binary_masks, scores, boxes, iou_threshold=0.3):
@@ -988,6 +1239,22 @@ class SAM3TrainerNative:
             cost_class=2.0, cost_bbox=5.0, cost_giou=2.0, focal=True
         )
 
+        # 负样本（错误标注）监督配置：只对“错误区域”加权，GT 仍是正确 mask
+        neg_cfg = self.config.get("negative_supervision", {}) or {}
+        self.neg_enabled = bool(neg_cfg.get("enable", False))
+        self.neg_ann_file = neg_cfg.get("ann_file", "wrong_ann.json")
+        self.neg_weight_extra = float(neg_cfg.get("weight_extra", 3.0))
+        self.neg_weight_missed = float(neg_cfg.get("weight_missed", 3.0))
+        self.neg_apply_to_dice = bool(neg_cfg.get("apply_to_dice", False))
+        self.neg_cache = bool(neg_cfg.get("cache", True))
+        if self.neg_enabled:
+            print_rank0(
+                f"负样本监督: 开启 (ann_file={self.neg_ann_file}, "
+                f"weight_extra={self.neg_weight_extra}, "
+                f"weight_missed={self.neg_weight_missed}, "
+                f"apply_to_dice={self.neg_apply_to_dice})"
+            )
+
         # Create loss functions with correct weights (from original SAM3 training config)
         # Note: These weights are for mask-based training
         loss_fns = [
@@ -1007,7 +1274,18 @@ class SAM3TrainerNative:
                 use_presence=True,
                 pad_n_queries=200,
             ),
-            Masks(
+            WeightedMasks(
+                weight_dict={
+                    "loss_mask": 200.0,  # Much higher weight for mask loss!
+                    "loss_dice": 10.0
+                },
+                focal_alpha=0.25,
+                focal_gamma=2.0,
+                compute_aux=False,
+                neg_weight_extra=self.neg_weight_extra,
+                neg_weight_missed=self.neg_weight_missed,
+                apply_to_dice=self.neg_apply_to_dice,
+            ) if self.neg_enabled else Masks(
                 weight_dict={
                     "loss_mask": 200.0,  # Much higher weight for mask loss!
                     "loss_dice": 10.0
@@ -1042,7 +1320,13 @@ class SAM3TrainerNative:
 
         # Load datasets using COCO format
         print_rank0(f"\nLoading training data from {data_dir}...")
-        train_ds = COCOSegmentDataset(data_dir=data_dir, split="train")
+        neg_ann_file = self.neg_ann_file if self.neg_enabled else None
+        train_ds = COCOSegmentDataset(
+            data_dir=data_dir,
+            split="train",
+            neg_ann_file=neg_ann_file,
+            neg_cache=self.neg_cache,
+        )
 
         # Check if validation data exists
         has_validation = False
@@ -1050,7 +1334,12 @@ class SAM3TrainerNative:
 
         try:
             print_rank0(f"\nLoading validation data from {data_dir}...")
-            val_ds = COCOSegmentDataset(data_dir=data_dir, split="valid")
+            val_ds = COCOSegmentDataset(
+                data_dir=data_dir,
+                split="valid",
+                neg_ann_file=neg_ann_file,
+                neg_cache=self.neg_cache,
+            )
             if len(val_ds) > 0:
                 has_validation = True
                 print_rank0(f"Found validation data: {len(val_ds)} images")
@@ -1065,7 +1354,28 @@ class SAM3TrainerNative:
             val_ds = None
 
         def collate_fn(batch):
-            return collate_fn_api(batch, dict_key="input", with_seg_masks=True)
+            out = collate_fn_api(batch, dict_key="input", with_seg_masks=True)
+            # 负样本权重码图：数据集里是「每图一张」，这里按每图的实例数展开成
+            # 「逐实例一张」，顺序与 collate_fn_api 里 segments.extend 的顺序完全一致
+            # （都是 for dp in batch: for q in dp.find_queries: for object_id ...）
+            per_instance = []
+            n_obj_total = 0
+            ref_shape = None
+            for dp in batch:
+                n_obj = sum(len(q.object_ids_output) for q in dp.find_queries)
+                n_obj_total += n_obj
+                code = getattr(dp, "neg_weight_code", None)
+                if code is not None and ref_shape is None:
+                    ref_shape = code.shape
+                per_instance.extend([code] * n_obj)
+            if n_obj_total == 0 or ref_shape is None:
+                out["neg_weight_codes"] = None
+            else:
+                out["neg_weight_codes"] = torch.stack([
+                    c if c is not None else torch.zeros(ref_shape, dtype=torch.uint8)
+                    for c in per_instance
+                ])
+            return out
 
         # Create samplers for distributed training
         train_sampler = None
@@ -1237,6 +1547,11 @@ class SAM3TrainerNative:
                 # Move to device
                 input_batch = move_to_device(input_batch, self.device)
 
+                # 负样本权重码图 [B, H, W] uint8
+                neg_codes = batch_dict.get("neg_weight_codes", None)
+                if neg_codes is not None:
+                    neg_codes = neg_codes.to(self.device, non_blocking=True)
+
                 # Forward pass
                 # outputs_list is SAM3Output, we need to pass the whole thing to loss_wrapper
                 if use_amp:
@@ -1248,6 +1563,11 @@ class SAM3TrainerNative:
                 # Prepare targets for loss
                 # input_batch.find_targets is a list of BatchedFindTarget (one per stage)
                 find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+
+                # 把负样本权重码图挂到 targets（WeightedMasks 会读取）
+                if neg_codes is not None:
+                    for targets in find_targets:
+                        targets["neg_weight_codes"] = neg_codes
 
                 # Move targets to device
                 for targets in find_targets:
@@ -1316,6 +1636,10 @@ class SAM3TrainerNative:
                         input_batch = batch_dict["input"]
                         input_batch = move_to_device(input_batch, self.device)
 
+                        neg_codes = batch_dict.get("neg_weight_codes", None)
+                        if neg_codes is not None:
+                            neg_codes = neg_codes.to(self.device, non_blocking=True)
+
                         # Forward pass
                         if use_amp:
                             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -1325,6 +1649,11 @@ class SAM3TrainerNative:
 
                         # Prepare targets
                         find_targets = [self._unwrapped_model.back_convert(target) for target in input_batch.find_targets]
+
+                        # 把负样本权重码图挂到 targets（WeightedMasks 会读取）
+                        if neg_codes is not None:
+                            for targets in find_targets:
+                                targets["neg_weight_codes"] = neg_codes
 
                         # Move targets to device
                         for targets in find_targets:
